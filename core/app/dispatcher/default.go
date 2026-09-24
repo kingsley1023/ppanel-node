@@ -4,6 +4,7 @@ package dispatcher
 
 import (
 	"context"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -43,7 +44,10 @@ type cachedReader struct {
 func (r *cachedReader) Cache(b *buf.Buffer, deadline time.Duration) error {
 	mb, err := r.reader.ReadMultiBufferTimeout(deadline)
 	r.Lock()
-	if err != nil {
+	// A sniff read is speculative. A timeout or protocol probe error must not
+	// poison the stream handed to the selected outbound. Preserve EOF only
+	// because it is terminal; cached payload is still replayed.
+	if err == io.EOF {
 		r.err = err
 	}
 	if !mb.IsEmpty() {
