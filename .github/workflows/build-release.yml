@@ -1,0 +1,212 @@
+name: Build and publish release
+
+# Merging deploy/dev into deploy/production builds the node binaries from the
+# merge commit and publishes them as a GitHub release. scripts/install.sh
+# downloads ppanel-node-linux-<arch>.zip from the latest release, so the zip
+# names and layout (ppnode, geoip.dat, geosite.dat, README.md, LICENSE) follow
+# the upstream "Build and Release" workflow. Only the architectures that
+# install.sh can select are built: 64 (amd64), arm64-v8a and s390x.
+on:
+  pull_request_target:
+    types: [closed]
+    branches:
+      - deploy/production
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a GitHub release (untick to only test and build; the binaries stay attached to the run)
+        type: boolean
+        default: true
+
+concurrency:
+  group: build-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.pull_request.merged == true &&
+        github.event.pull_request.base.ref == 'deploy/production' &&
+        github.event.pull_request.head.ref == 'deploy/dev' &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.production.outputs.sha }}
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Resolve production commit
+        id: production
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            sha="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/deploy/production" --jq '.object.sha')"
+          else
+            sha="$MERGE_SHA"
+          fi
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Production commit: $sha"
+
+      - name: Check out the production commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.production.outputs.sha }}
+          fetch-depth: 0
+
+      # <nearest upstream tag>-<short sha>, for example v1.1.13-1a2b3c4. The
+      # same string is stamped into the binary and shown by "ppnode version".
+      - name: Name the release
+        id: release
+        env:
+          SHA: ${{ steps.production.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(git describe --tags --abbrev=0 "$SHA" 2>/dev/null || echo v0.0.0)"
+          echo "tag=${base}-${SHA:0:7}" >> "$GITHUB_OUTPUT"
+          echo "Release tag: ${base}-${SHA:0:7}"
+
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the production commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Test with race detector
+        run: go test -race -timeout 5m ./...
+
+  build:
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - goarch: amd64
+            asset: linux-64
+          - goarch: arm64
+            asset: linux-arm64-v8a
+          - goarch: s390x
+            asset: linux-s390x
+    env:
+      GOOS: linux
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: 0
+      ASSET: ${{ matrix.asset }}
+      VERSION: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - name: Check out the production commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: |
+          mkdir build_assets
+          go build -v -o build_assets/ppnode -trimpath \
+            -ldflags "-X 'github.com/perfect-panel/ppanel-node/cmd.version=${VERSION}' -s -w -buildid="
+      - name: Add README, LICENSE and geodata
+        run: |
+          cp README.md LICENSE build_assets/
+          for name in geoip geosite; do
+            curl -fsSL --retry 3 --retry-delay 5 \
+              "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/${name}.dat" \
+              -o "build_assets/${name}.dat"
+            test "$(wc -c < "build_assets/${name}.dat")" -gt 1000000
+          done
+      - name: Package
+        run: |
+          archive="ppanel-node-${ASSET}.zip"
+          (cd build_assets && touch -mt "$(date +%Y01010000)" * && zip -9qr "../${archive}" .)
+          : > "${archive}.dgst"
+          for method in md5 sha1 sha256 sha512; do
+            openssl dgst "-${method}" "$archive" | sed 's/([^)]*)//g' >> "${archive}.dgst"
+          done
+          unzip -l "$archive"
+      - name: Upload the archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppanel-node-${{ matrix.asset }}
+          path: |
+            ppanel-node-${{ matrix.asset }}.zip
+            ppanel-node-${{ matrix.asset }}.zip.dgst
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, build]
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - name: Download the archives
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: Check the archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd assets
+          ls -l
+          for f in ppanel-node-linux-64.zip ppanel-node-linux-64.zip.dgst \
+                   ppanel-node-linux-arm64-v8a.zip ppanel-node-linux-s390x.zip; do
+            test -s "$f"
+          done
+          for z in *.zip; do
+            unzip -tq "$z"
+            unzip -Z1 "$z" > listing.txt
+            for member in ppnode geoip.dat geosite.dat; do
+              grep -qx "$member" listing.txt || { echo "$z has no $member" >&2; exit 1; }
+            done
+          done
+          rm listing.txt
+
+      # The release is created as a pre-release, which "releases/latest" ignores,
+      # and only marked as the latest release once every archive is attached.
+      - name: Publish the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            if [ "$(gh release view "$TAG" --json isPrerelease --jq .isPrerelease)" != "true" ]; then
+              echo "Release $TAG is already published; nothing to do."
+              exit 0
+            fi
+            gh release upload "$TAG" assets/* --clobber
+          else
+            gh release create "$TAG" assets/* --target "$SHA" --title "$TAG" --prerelease \
+              --notes "Built from deploy/production at ${SHA}. Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          fi
+          gh release edit "$TAG" --prerelease=false --latest
+          echo "Published ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/releases/tag/${TAG}"

@@ -1,0 +1,88 @@
+name: Sync upstream master
+
+on:
+  schedule:
+    # 00:37 Beijing time (16:37 UTC). Avoid the top of the hour, where GitHub
+    # delays scheduled runs the most.
+    - cron: '37 16 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UPSTREAM_REPO: https://github.com/perfect-panel/ppanel-node.git
+      UPSTREAM_BRANCH: master
+      SYNC_BRANCH: sync/main
+    steps:
+      - name: Resolve upstream commit
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote "$UPSTREAM_REPO" "refs/heads/$UPSTREAM_BRANCH" | awk '{print $1}')"
+          test -n "$sha"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Upstream $UPSTREAM_BRANCH: $sha"
+
+      # Fetch the upstream objects and push them as sync/main, rather than moving
+      # the ref through the REST API: that only works while every upstream commit
+      # is already in this repository's object store.
+      #
+      # Prefer the built-in token: pushes made with it do not trigger other
+      # workflows. It is not allowed to create or update files under
+      # .github/workflows, so fall back to the repository secret SYNC_TOKEN (a
+      # PAT with repo + workflow scopes) only when that happens.
+      - name: Update sync/main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SYNC_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref_endpoint="repos/${GITHUB_REPOSITORY}/git/ref/heads/${SYNC_BRANCH//\//%2F}"
+          current_sha="$(gh api "$ref_endpoint" --jq '.object.sha' 2>/dev/null || true)"
+
+          if [ "$current_sha" = "$UPSTREAM_SHA" ]; then
+            echo "$SYNC_BRANCH is already at $UPSTREAM_SHA"
+            exit 0
+          fi
+
+          git init -q upstream-mirror
+          cd upstream-mirror
+          git fetch --no-tags --quiet "$UPSTREAM_REPO" "$UPSTREAM_BRANCH"
+          fetched_sha="$(git rev-parse FETCH_HEAD)"
+
+          if [ "$current_sha" = "$fetched_sha" ]; then
+            echo "$SYNC_BRANCH is already at $fetched_sha"
+            exit 0
+          fi
+
+          push_with() {
+            local auth
+            auth="$(printf 'x-access-token:%s' "$1" | base64 | tr -d '\n')"
+            echo "::add-mask::$auth"
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+              push --force "https://github.com/${GITHUB_REPOSITORY}.git" \
+              "FETCH_HEAD:refs/heads/${SYNC_BRANCH}"
+          }
+
+          if push_with "$GH_TOKEN"; then
+            :
+          elif [ -n "${SYNC_TOKEN:-}" ]; then
+            echo "::notice::The built-in token was rejected (upstream changed .github/workflows?). Retrying with SYNC_TOKEN."
+            push_with "$SYNC_TOKEN"
+          else
+            echo "::error::Failed to update ${SYNC_BRANCH}. If upstream changed .github/workflows, the built-in token is not allowed to push it. Add the repository secret SYNC_TOKEN (PAT with repo and workflow scopes)."
+            exit 1
+          fi
+          echo "$SYNC_BRANCH updated to $fetched_sha"
