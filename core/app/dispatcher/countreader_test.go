@@ -1,6 +1,7 @@
 package dispatcher
 
 import (
+	"context"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -43,6 +44,34 @@ func TestCounterReaderPreservesFinalBytesAndTimeout(t *testing.T) {
 	}
 }
 
+func TestSniffingCacheDoesNotPoisonPayloadAfterTimeout(t *testing.T) {
+	reader := &cachedReader{reader: &sniffTimeoutReader{}}
+	sniffed := buf.New()
+	defer sniffed.Release()
+	if err := reader.Cache(sniffed, time.Millisecond); err == nil {
+		t.Fatal("expected sniff timeout")
+	}
+	mb, err := reader.ReadMultiBuffer()
+	defer buf.ReleaseMulti(mb)
+	if got := mb.Len(); got != int32(len("chain-handshake")) {
+		t.Fatalf("cached payload length = %d, want %d", got, len("chain-handshake"))
+	}
+	if err != nil {
+		t.Fatalf("cached payload returned error: %v", err)
+	}
+}
+
+type sniffTimeoutReader struct{}
+
+func (r *sniffTimeoutReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	return nil, context.DeadlineExceeded
+}
+
+func (r *sniffTimeoutReader) ReadMultiBufferTimeout(time.Duration) (buf.MultiBuffer, error) {
+	b := buf.New()
+	b.Write([]byte("chain-handshake"))
+	return buf.MultiBuffer{b}, context.DeadlineExceeded
+}
 func TestSniffingCachePreservesPayloadReturnedWithEOF(t *testing.T) {
 	count := &atomic.Int64{}
 	reader := &cachedReader{reader: &CounterReader{Reader: &eofReader{}, Counter: count}}
