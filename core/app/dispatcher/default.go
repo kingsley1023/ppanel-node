@@ -34,6 +34,10 @@ import (
 
 var errSniffingTimeout = errors.New("timeout on sniffing")
 
+// ErrAdmissionRejected lets protocol adapters report quota/admission failure
+// before acknowledging a flow setup to their clients.
+var ErrAdmissionRejected = errors.New("device admission rejected")
+
 type cachedReader struct {
 	sync.Mutex
 	reader buf.TimeoutReader
@@ -194,7 +198,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 			common.Close(inboundLink.Writer)
 			common.Interrupt(outboundLink.Reader)
 			common.Interrupt(inboundLink.Reader)
-			return nil, nil, nil, errors.New("Limited ", user.Email, " by conn or ip")
+			return nil, nil, nil, errors.New("Limited ", user.Email, " by conn or ip").Base(ErrAdmissionRejected)
 		}
 		lmloaded, _ := d.LinkManagers.LoadOrStore(user.Email, &LinkManager{links: make(map[*ManagedWriter]buf.Reader)})
 		lm := lmloaded.(*LinkManager)
@@ -363,7 +367,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 			errors.LogInfo(ctx, "Limited ", user.Email, " by conn or ip")
 			common.Close(outbound.Writer)
 			common.Interrupt(outbound.Reader)
-			return errors.New("Limited ", user.Email, " by conn or ip")
+			return errors.New("Limited ", user.Email, " by conn or ip").Base(ErrAdmissionRejected)
 		}
 		lmloaded, _ := d.LinkManagers.LoadOrStore(user.Email, &LinkManager{links: make(map[*ManagedWriter]buf.Reader)})
 		lm := lmloaded.(*LinkManager)
@@ -375,7 +379,8 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 		outbound.Writer = managedWriter
 		if w != nil {
 			sessionInbound.CanSpliceCopy = 3
-			outbound.Writer = rate.NewRateLimitWriter(outbound.Writer, w)
+			outbound.Reader = rate.NewRateLimitReader(ctx, outbound.Reader, w)
+			outbound.Writer = rate.NewRateLimitWriterContext(ctx, outbound.Writer, w)
 		}
 		stored, _ := d.Counter.LoadOrStore(sessionInbound.Tag, counter.NewTrafficCounter())
 		t := stored.(*counter.TrafficCounter)
